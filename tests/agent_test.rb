@@ -1,0 +1,1028 @@
+# frozen_string_literal: true
+
+require 'minitest/autorun'
+require 'rack/test'
+require 'json'
+
+# Suppress logging during tests
+ENV['SIGNALWIRE_LOG_MODE'] = 'off'
+
+require_relative '../lib/signalwire_agents'
+
+class AgentBaseConstructionTest < Minitest::Test
+  def test_default_construction
+    agent = SignalWireAgents::AgentBase.new
+    assert_equal 'agent', agent.name
+    assert_equal '/', agent.route
+    assert_equal '0.0.0.0', agent.host
+    assert_equal 3000, agent.port
+    assert_instance_of SignalWireAgents::Logging::Logger, agent.logger
+  end
+
+  def test_custom_options
+    agent = SignalWireAgents::AgentBase.new(
+      name: 'my_agent',
+      route: '/bot',
+      host: '127.0.0.1',
+      port: 8080
+    )
+    assert_equal 'my_agent', agent.name
+    assert_equal '/bot', agent.route
+    assert_equal '127.0.0.1', agent.host
+    assert_equal 8080, agent.port
+  end
+
+  def test_route_normalisation
+    agent = SignalWireAgents::AgentBase.new(route: '/foo/')
+    assert_equal '/foo', agent.route
+  end
+
+  def test_empty_route_becomes_root
+    agent = SignalWireAgents::AgentBase.new(route: '')
+    assert_equal '/', agent.route
+  end
+
+  def test_port_from_env
+    ENV['PORT'] = '9999'
+    agent = SignalWireAgents::AgentBase.new
+    assert_equal 9999, agent.port
+  ensure
+    ENV.delete('PORT')
+  end
+
+  def test_basic_auth_auto_generated
+    agent = SignalWireAgents::AgentBase.new
+    creds = agent.get_basic_auth_credentials
+    assert_equal 2, creds.length
+    refute_empty creds[0]
+    refute_empty creds[1]
+  end
+
+  def test_basic_auth_explicit
+    agent = SignalWireAgents::AgentBase.new(basic_auth: ['user', 'pass'])
+    assert_equal ['user', 'pass'], agent.get_basic_auth_credentials
+  end
+
+  def test_basic_auth_from_env
+    ENV['SWML_BASIC_AUTH_USER']     = 'envuser'
+    ENV['SWML_BASIC_AUTH_PASSWORD'] = 'envpass'
+    agent = SignalWireAgents::AgentBase.new
+    assert_equal ['envuser', 'envpass'], agent.get_basic_auth_credentials
+  ensure
+    ENV.delete('SWML_BASIC_AUTH_USER')
+    ENV.delete('SWML_BASIC_AUTH_PASSWORD')
+  end
+end
+
+# =========================================================================
+# Prompt tests
+# =========================================================================
+class AgentPromptTest < Minitest::Test
+  def setup
+    @agent = SignalWireAgents::AgentBase.new
+  end
+
+  def test_text_mode
+    @agent.set_prompt_text('Hello world')
+    assert_equal 'Hello world', @agent.get_prompt
+  end
+
+  def test_pom_mode_direct
+    pom = [{ 'title' => 'Intro', 'body' => 'Hi' }]
+    @agent.set_prompt_pom(pom)
+    assert_equal pom, @agent.get_prompt
+  end
+
+  def test_pom_sections
+    @agent.prompt_add_section('Personality', 'Be helpful')
+    @agent.prompt_add_section('Rules', nil, bullets: ['Be concise', 'Be accurate'])
+    prompt = @agent.get_prompt
+    assert_equal 2, prompt.length
+    assert_equal 'Personality', prompt[0]['title']
+    assert_equal 'Be helpful', prompt[0]['body']
+    assert_equal 'Rules', prompt[1]['title']
+    assert_equal ['Be concise', 'Be accurate'], prompt[1]['bullets']
+  end
+
+  def test_prompt_add_to_section
+    @agent.prompt_add_section('Intro', 'Hello')
+    @agent.prompt_add_to_section('Intro', ' World')
+    prompt = @agent.get_prompt
+    assert_equal 'Hello World', prompt[0]['body']
+  end
+
+  def test_prompt_add_subsection
+    @agent.prompt_add_section('Main', 'Top-level body')
+    @agent.prompt_add_subsection('Main', 'Sub', 'Sub body', bullets: ['a', 'b'])
+    prompt = @agent.get_prompt
+    assert_equal 1, prompt[0]['subsections'].length
+    assert_equal 'Sub', prompt[0]['subsections'][0]['title']
+    assert_equal 'Sub body', prompt[0]['subsections'][0]['body']
+    assert_equal ['a', 'b'], prompt[0]['subsections'][0]['bullets']
+  end
+
+  def test_prompt_has_section
+    @agent.prompt_add_section('Foo', 'bar')
+    assert @agent.prompt_has_section?('Foo')
+    refute @agent.prompt_has_section?('Baz')
+  end
+
+  def test_text_mode_clears_pom
+    @agent.prompt_add_section('Sec', 'body')
+    @agent.set_prompt_text('Raw text')
+    assert_equal 'Raw text', @agent.get_prompt
+  end
+
+  def test_pom_mode_clears_text
+    @agent.set_prompt_text('Raw text')
+    @agent.prompt_add_section('Sec', 'body')
+    prompt = @agent.get_prompt
+    assert_instance_of Array, prompt
+    assert_equal 'Sec', prompt[0]['title']
+  end
+
+  def test_post_prompt
+    @agent.set_post_prompt('Summarize the call')
+    swml = @agent.render_swml
+    ai = swml['sections']['main'].find { |v| v.key?('ai') }['ai']
+    assert_equal 'Summarize the call', ai['post_prompt']['text']
+  end
+end
+
+# =========================================================================
+# Tool tests
+# =========================================================================
+class AgentToolTest < Minitest::Test
+  def setup
+    @agent = SignalWireAgents::AgentBase.new
+  end
+
+  def test_define_tool_with_block
+    @agent.define_tool(
+      name: 'greet',
+      description: 'Say hello',
+      parameters: { 'name' => { 'type' => 'string', 'description' => 'Name' } }
+    ) do |args, _raw|
+      SignalWireAgents::Swaig::FunctionResult.new("Hello, #{args['name']}!")
+    end
+
+    tools = @agent.define_tools
+    assert_equal 1, tools.length
+    assert_equal 'greet', tools[0]['function']
+    assert_equal 'Say hello', tools[0]['description']
+  end
+
+  def test_register_swaig_function
+    dm_func = {
+      'function'    => 'weather',
+      'description' => 'Get weather',
+      'parameters'  => { 'type' => 'object', 'properties' => {} },
+      'data_map'    => { 'webhooks' => [] }
+    }
+    @agent.register_swaig_function(dm_func)
+    tools = @agent.define_tools
+    assert_equal 1, tools.length
+    assert_equal 'weather', tools[0]['function']
+    assert tools[0].key?('data_map')
+  end
+
+  def test_on_function_call_dispatch
+    @agent.define_tool(
+      name: 'echo',
+      description: 'Echo back',
+      parameters: {}
+    ) do |args, _raw|
+      SignalWireAgents::Swaig::FunctionResult.new("Echo: #{args['text']}")
+    end
+
+    result = @agent.on_function_call('echo', { 'text' => 'hello' }, {})
+    assert_equal 'Echo: hello', result['response']
+  end
+
+  def test_on_function_call_unknown
+    result = @agent.on_function_call('nonexistent', {}, {})
+    assert_includes result['response'], 'not found'
+  end
+
+  def test_tool_with_fillers
+    @agent.define_tool(
+      name: 'slow_op',
+      description: 'Slow operation',
+      fillers: { 'en-US' => ['Please wait...', 'Working on it...'] }
+    ) { |_, _| SignalWireAgents::Swaig::FunctionResult.new('Done') }
+
+    tools = @agent.define_tools
+    assert_equal({ 'en-US' => ['Please wait...', 'Working on it...'] }, tools[0]['fillers'])
+  end
+
+  def test_define_tool_returns_self
+    result = @agent.define_tool(name: 'x', description: 'x') { |_, _| }
+    assert_same @agent, result
+  end
+end
+
+# =========================================================================
+# AI Config tests
+# =========================================================================
+class AgentAIConfigTest < Minitest::Test
+  def setup
+    @agent = SignalWireAgents::AgentBase.new
+  end
+
+  def test_add_hint
+    @agent.add_hint('SignalWire')
+    swml = @agent.render_swml
+    ai = swml['sections']['main'].find { |v| v.key?('ai') }['ai']
+    assert_includes ai['hints'], 'SignalWire'
+  end
+
+  def test_add_hints
+    @agent.add_hints(['one', 'two', 'three'])
+    swml = @agent.render_swml
+    ai = swml['sections']['main'].find { |v| v.key?('ai') }['ai']
+    assert_equal ['one', 'two', 'three'], ai['hints']
+  end
+
+  def test_add_language
+    @agent.add_language({ 'name' => 'English', 'code' => 'en-US', 'voice' => 'rachel' })
+    swml = @agent.render_swml
+    ai = swml['sections']['main'].find { |v| v.key?('ai') }['ai']
+    assert_equal 1, ai['languages'].length
+    assert_equal 'English', ai['languages'][0]['name']
+  end
+
+  def test_set_languages
+    langs = [
+      { 'name' => 'English', 'code' => 'en-US', 'voice' => 'rachel' },
+      { 'name' => 'French', 'code' => 'fr-FR', 'voice' => 'amelie' }
+    ]
+    @agent.set_languages(langs)
+    swml = @agent.render_swml
+    ai = swml['sections']['main'].find { |v| v.key?('ai') }['ai']
+    assert_equal 2, ai['languages'].length
+  end
+
+  def test_set_param
+    @agent.set_param('temperature', 0.7)
+    swml = @agent.render_swml
+    ai = swml['sections']['main'].find { |v| v.key?('ai') }['ai']
+    assert_equal 0.7, ai['params']['temperature']
+  end
+
+  def test_set_params
+    @agent.set_params({ 'temperature' => 0.7, 'top_p' => 0.9 })
+    swml = @agent.render_swml
+    ai = swml['sections']['main'].find { |v| v.key?('ai') }['ai']
+    assert_equal 0.7, ai['params']['temperature']
+    assert_equal 0.9, ai['params']['top_p']
+  end
+
+  def test_set_global_data
+    @agent.set_global_data({ 'key' => 'value' })
+    swml = @agent.render_swml
+    ai = swml['sections']['main'].find { |v| v.key?('ai') }['ai']
+    assert_equal 'value', ai['global_data']['key']
+  end
+
+  def test_update_global_data
+    @agent.set_global_data({ 'a' => 1 })
+    @agent.update_global_data({ 'b' => 2 })
+    swml = @agent.render_swml
+    ai = swml['sections']['main'].find { |v| v.key?('ai') }['ai']
+    assert_equal 1, ai['global_data']['a']
+    assert_equal 2, ai['global_data']['b']
+  end
+
+  def test_set_native_functions
+    @agent.set_native_functions(['check_for_input'])
+    swml = @agent.render_swml
+    ai = swml['sections']['main'].find { |v| v.key?('ai') }['ai']
+    assert_includes ai['SWAIG']['native_functions'], 'check_for_input'
+  end
+
+  def test_add_pronunciation
+    @agent.add_pronunciation('SW', 'SignalWire')
+    swml = @agent.render_swml
+    ai = swml['sections']['main'].find { |v| v.key?('ai') }['ai']
+    assert_equal 'SW', ai['pronounce'][0]['replace']
+    assert_equal 'SignalWire', ai['pronounce'][0]['with']
+  end
+
+  def test_set_pronunciations
+    rules = [{ 'replace' => 'AI', 'with' => 'Artificial Intelligence' }]
+    @agent.set_pronunciations(rules)
+    swml = @agent.render_swml
+    ai = swml['sections']['main'].find { |v| v.key?('ai') }['ai']
+    assert_equal 1, ai['pronounce'].length
+  end
+
+  def test_set_internal_fillers
+    @agent.set_internal_fillers({
+      'next_step' => { 'en-US' => ['Moving on...'] }
+    })
+    swml = @agent.render_swml
+    ai = swml['sections']['main'].find { |v| v.key?('ai') }['ai']
+    assert_equal ['Moving on...'], ai['SWAIG']['internal_fillers']['next_step']['en-US']
+  end
+
+  def test_add_internal_filler
+    @agent.add_internal_filler('check_time', 'en-US', ['Checking time...'])
+    swml = @agent.render_swml
+    ai = swml['sections']['main'].find { |v| v.key?('ai') }['ai']
+    assert_equal ['Checking time...'], ai['SWAIG']['internal_fillers']['check_time']['en-US']
+  end
+
+  def test_enable_debug_events
+    @agent.enable_debug_events(2)
+    swml = @agent.render_swml
+    ai = swml['sections']['main'].find { |v| v.key?('ai') }['ai']
+    assert ai['params'].key?('debug_webhook_url')
+    assert_equal 2, ai['params']['debug_webhook_level']
+  end
+
+  def test_add_function_include
+    @agent.add_function_include('https://example.com/funcs', ['fn1', 'fn2'],
+                                meta_data: { 'key' => 'val' })
+    swml = @agent.render_swml
+    ai = swml['sections']['main'].find { |v| v.key?('ai') }['ai']
+    inc = ai['SWAIG']['includes']
+    assert_equal 1, inc.length
+    assert_equal 'https://example.com/funcs', inc[0]['url']
+    assert_equal ['fn1', 'fn2'], inc[0]['functions']
+    assert_equal({ 'key' => 'val' }, inc[0]['meta_data'])
+  end
+
+  def test_set_function_includes
+    includes = [{ 'url' => 'https://a.com', 'functions' => ['f1'] }]
+    @agent.set_function_includes(includes)
+    swml = @agent.render_swml
+    ai = swml['sections']['main'].find { |v| v.key?('ai') }['ai']
+    assert_equal 1, ai['SWAIG']['includes'].length
+  end
+
+  def test_set_prompt_llm_params
+    @agent.set_prompt_text('Hello')
+    @agent.set_prompt_llm_params(temperature: 0.3, top_p: 0.9)
+    swml = @agent.render_swml
+    ai = swml['sections']['main'].find { |v| v.key?('ai') }['ai']
+    assert_equal 0.3, ai['prompt']['temperature']
+    assert_equal 0.9, ai['prompt']['top_p']
+    assert_equal 'Hello', ai['prompt']['text']
+  end
+
+  def test_set_post_prompt_llm_params
+    @agent.set_post_prompt('Summarize')
+    @agent.set_post_prompt_llm_params(model: 'gpt-4o-mini', temperature: 0.5)
+    swml = @agent.render_swml
+    ai = swml['sections']['main'].find { |v| v.key?('ai') }['ai']
+    assert_equal 0.5, ai['post_prompt']['temperature']
+    assert_equal 'gpt-4o-mini', ai['post_prompt']['model']
+    assert_equal 'Summarize', ai['post_prompt']['text']
+  end
+
+  def test_add_pattern_hint
+    @agent.add_pattern_hint('SW.*', hint: 'SignalWire', language: 'en-US')
+    swml = @agent.render_swml
+    ai = swml['sections']['main'].find { |v| v.key?('ai') }['ai']
+    pattern_hint = ai['hints'].find { |h| h.is_a?(Hash) }
+    assert_equal 'SW.*', pattern_hint['pattern']
+    assert_equal 'SignalWire', pattern_hint['hint']
+  end
+end
+
+# =========================================================================
+# Verb management tests
+# =========================================================================
+class AgentVerbTest < Minitest::Test
+  def setup
+    @agent = SignalWireAgents::AgentBase.new
+  end
+
+  def test_pre_answer_verbs
+    @agent.add_pre_answer_verb('play', { 'url' => 'https://example.com/ring.mp3' })
+    swml = @agent.render_swml
+    main = swml['sections']['main']
+    # Pre-answer verb should come before 'answer'
+    first = main[0]
+    assert first.key?('play')
+    assert_equal 'https://example.com/ring.mp3', first['play']['url']
+  end
+
+  def test_clear_pre_answer_verbs
+    @agent.add_pre_answer_verb('play', { 'url' => 'ring.mp3' })
+    @agent.clear_pre_answer_verbs
+    swml = @agent.render_swml
+    main = swml['sections']['main']
+    assert_equal 'answer', main[0].keys.first
+  end
+
+  def test_post_answer_verbs
+    @agent.add_post_answer_verb('play', { 'url' => 'welcome.mp3' })
+    swml = @agent.render_swml
+    main = swml['sections']['main']
+    # After answer, before AI
+    answer_idx = main.index { |v| v.key?('answer') }
+    ai_idx     = main.index { |v| v.key?('ai') }
+    play_idx   = main.index { |v| v.key?('play') }
+    assert play_idx > answer_idx
+    assert play_idx < ai_idx
+  end
+
+  def test_clear_post_answer_verbs
+    @agent.add_post_answer_verb('play', {})
+    @agent.clear_post_answer_verbs
+    swml = @agent.render_swml
+    main = swml['sections']['main']
+    refute main.any? { |v| v.key?('play') }
+  end
+
+  def test_post_ai_verbs
+    @agent.add_post_ai_verb('hangup', {})
+    swml = @agent.render_swml
+    main = swml['sections']['main']
+    ai_idx     = main.index { |v| v.key?('ai') }
+    hangup_idx = main.index { |v| v.key?('hangup') }
+    assert hangup_idx > ai_idx
+  end
+
+  def test_clear_post_ai_verbs
+    @agent.add_post_ai_verb('hangup', {})
+    @agent.clear_post_ai_verbs
+    swml = @agent.render_swml
+    main = swml['sections']['main']
+    refute main.any? { |v| v.key?('hangup') }
+  end
+
+  def test_answer_verb_config
+    @agent.add_answer_verb({ 'max_duration' => 3600 })
+    swml = @agent.render_swml
+    main = swml['sections']['main']
+    answer = main.find { |v| v.key?('answer') }
+    assert_equal 3600, answer['answer']['max_duration']
+  end
+end
+
+# =========================================================================
+# Contexts tests
+# =========================================================================
+class AgentContextsTest < Minitest::Test
+  def test_define_contexts_returns_builder
+    agent = SignalWireAgents::AgentBase.new
+    builder = agent.define_contexts
+    assert_instance_of SignalWireAgents::Contexts::ContextBuilder, builder
+  end
+
+  def test_contexts_alias
+    agent = SignalWireAgents::AgentBase.new
+    assert_same agent.define_contexts, agent.contexts
+  end
+
+  def test_contexts_rendered_in_swml
+    agent = SignalWireAgents::AgentBase.new
+    ctx = agent.define_contexts.add_context('default')
+    ctx.add_step('greeting').set_text('Say hello')
+    swml = agent.render_swml
+    ai = swml['sections']['main'].find { |v| v.key?('ai') }['ai']
+    assert ai.key?('contexts'), 'Expected contexts in AI config'
+    assert ai['contexts'].key?('default')
+  end
+end
+
+# =========================================================================
+# Skill integration tests
+# =========================================================================
+class AgentSkillTest < Minitest::Test
+  def test_add_skill_datetime
+    agent = SignalWireAgents::AgentBase.new
+    agent.add_skill('datetime')
+    assert agent.has_skill?('datetime')
+    assert_includes agent.list_skills, 'datetime'
+    # Should have registered tools
+    tools = agent.define_tools
+    tool_names = tools.map { |t| t['function'] }
+    assert_includes tool_names, 'get_current_time'
+    assert_includes tool_names, 'get_current_date'
+  end
+
+  def test_add_skill_returns_self
+    agent = SignalWireAgents::AgentBase.new
+    result = agent.add_skill('datetime')
+    assert_same agent, result
+  end
+
+  def test_remove_skill
+    agent = SignalWireAgents::AgentBase.new
+    agent.add_skill('datetime')
+    agent.remove_skill('datetime')
+    refute agent.has_skill?('datetime')
+  end
+
+  def test_unknown_skill_raises
+    agent = SignalWireAgents::AgentBase.new
+    assert_raises(ArgumentError) { agent.add_skill('nonexistent_skill_xyz') }
+  end
+end
+
+# =========================================================================
+# render_swml tests
+# =========================================================================
+class AgentRenderSwmlTest < Minitest::Test
+  def test_basic_structure
+    agent = SignalWireAgents::AgentBase.new
+    swml = agent.render_swml
+    assert_equal '1.0.0', swml['version']
+    assert swml.key?('sections')
+    assert swml['sections'].key?('main')
+  end
+
+  def test_auto_answer
+    agent = SignalWireAgents::AgentBase.new(auto_answer: true)
+    swml = agent.render_swml
+    main = swml['sections']['main']
+    assert main.any? { |v| v.key?('answer') }
+  end
+
+  def test_no_auto_answer
+    agent = SignalWireAgents::AgentBase.new(auto_answer: false)
+    swml = agent.render_swml
+    main = swml['sections']['main']
+    refute main.any? { |v| v.key?('answer') }
+  end
+
+  def test_record_call
+    agent = SignalWireAgents::AgentBase.new(record_call: true, record_format: 'wav', record_stereo: false)
+    swml = agent.render_swml
+    main = swml['sections']['main']
+    rec = main.find { |v| v.key?('record_call') }
+    assert rec
+    assert_equal 'wav', rec['record_call']['format']
+    assert_equal false, rec['record_call']['stereo']
+  end
+
+  def test_with_tools
+    agent = SignalWireAgents::AgentBase.new
+    agent.define_tool(name: 'foo', description: 'Foo tool') { |_, _| }
+    swml = agent.render_swml
+    ai = swml['sections']['main'].find { |v| v.key?('ai') }['ai']
+    assert ai.key?('SWAIG')
+    funcs = ai['SWAIG']['functions']
+    assert_equal 1, funcs.length
+    assert_equal 'foo', funcs[0]['function']
+  end
+
+  def test_with_pom
+    agent = SignalWireAgents::AgentBase.new
+    agent.prompt_add_section('Intro', 'Hello')
+    swml = agent.render_swml
+    ai = swml['sections']['main'].find { |v| v.key?('ai') }['ai']
+    pom = ai['prompt']['pom']
+    assert_instance_of Array, pom
+    assert_equal 'Intro', pom[0]['title']
+  end
+
+  def test_with_text_prompt
+    agent = SignalWireAgents::AgentBase.new
+    agent.set_prompt_text('You are helpful.')
+    swml = agent.render_swml
+    ai = swml['sections']['main'].find { |v| v.key?('ai') }['ai']
+    assert_equal 'You are helpful.', ai['prompt']['text']
+  end
+
+  def test_with_params
+    agent = SignalWireAgents::AgentBase.new
+    agent.set_params({ 'temperature' => 0.5 })
+    swml = agent.render_swml
+    ai = swml['sections']['main'].find { |v| v.key?('ai') }['ai']
+    assert_equal 0.5, ai['params']['temperature']
+  end
+
+  def test_5_phase_ordering
+    agent = SignalWireAgents::AgentBase.new(record_call: true)
+    agent.add_pre_answer_verb('set', { 'x' => '1' })
+    agent.add_post_answer_verb('play', { 'url' => 'welcome.mp3' })
+    agent.add_post_ai_verb('hangup', {})
+    swml = agent.render_swml
+    main = swml['sections']['main']
+    keys = main.map { |v| v.keys.first }
+    # Pre-answer → answer → record_call → post_answer → ai → post-ai
+    set_idx    = keys.index('set')
+    ans_idx    = keys.index('answer')
+    rec_idx    = keys.index('record_call')
+    play_idx   = keys.index('play')
+    ai_idx     = keys.index('ai')
+    hangup_idx = keys.index('hangup')
+    assert set_idx < ans_idx,    "pre-answer should be before answer"
+    assert ans_idx < rec_idx,    "answer should be before record_call"
+    assert rec_idx < play_idx,   "record_call should be before post-answer"
+    assert play_idx < ai_idx,    "post-answer should be before ai"
+    assert ai_idx < hangup_idx,  "ai should be before post-ai"
+  end
+
+  def test_webhook_url_in_swml
+    agent = SignalWireAgents::AgentBase.new(basic_auth: ['u', 'p'])
+    agent.define_tool(name: 'test', description: 'Test') { |_, _| }
+    swml = agent.render_swml
+    ai = swml['sections']['main'].find { |v| v.key?('ai') }['ai']
+    default_url = ai['SWAIG']['defaults']['web_hook_url']
+    assert_includes default_url, '/swaig'
+    assert_includes default_url, 'u:p@'
+  end
+
+  def test_post_prompt_url_in_swml
+    agent = SignalWireAgents::AgentBase.new(basic_auth: ['u', 'p'])
+    agent.set_post_prompt('Summarize')
+    swml = agent.render_swml
+    ai = swml['sections']['main'].find { |v| v.key?('ai') }['ai']
+    assert_includes ai['post_prompt_url'], '/post_prompt'
+  end
+
+  def test_web_hook_url_override
+    agent = SignalWireAgents::AgentBase.new
+    agent.set_web_hook_url('https://custom.example.com/hook')
+    agent.define_tool(name: 'test', description: 'Test') { |_, _| }
+    swml = agent.render_swml
+    ai = swml['sections']['main'].find { |v| v.key?('ai') }['ai']
+    assert_equal 'https://custom.example.com/hook', ai['SWAIG']['defaults']['web_hook_url']
+  end
+
+  def test_post_prompt_url_override
+    agent = SignalWireAgents::AgentBase.new
+    agent.set_post_prompt('Sum')
+    agent.set_post_prompt_url('https://custom.example.com/pp')
+    swml = agent.render_swml
+    ai = swml['sections']['main'].find { |v| v.key?('ai') }['ai']
+    assert_equal 'https://custom.example.com/pp', ai['post_prompt_url']
+  end
+end
+
+# =========================================================================
+# Dynamic config tests
+# =========================================================================
+class AgentDynamicConfigTest < Minitest::Test
+  def test_dynamic_config_callback_applied
+    agent = SignalWireAgents::AgentBase.new
+    agent.set_prompt_text('Original')
+    agent.set_dynamic_config_callback do |_query, _body, _headers, ephemeral|
+      ephemeral.set_prompt_text('Modified')
+    end
+    swml = agent.render_swml
+    ai = swml['sections']['main'].find { |v| v.key?('ai') }['ai']
+    assert_equal 'Modified', ai['prompt']['text']
+  end
+
+  def test_original_not_mutated
+    agent = SignalWireAgents::AgentBase.new
+    agent.set_prompt_text('Original')
+    agent.set_dynamic_config_callback do |_query, _body, _headers, ephemeral|
+      ephemeral.set_prompt_text('Modified')
+      ephemeral.add_hint('NewHint')
+    end
+    # Render triggers dynamic config
+    agent.render_swml
+    # Original should be untouched
+    assert_equal 'Original', agent.get_prompt
+    # Render again to verify original state persists
+    swml = agent.render_swml
+    ai = swml['sections']['main'].find { |v| v.key?('ai') }['ai']
+    assert_equal 'Modified', ai['prompt']['text']
+  end
+
+  def test_dynamic_config_can_add_tools
+    agent = SignalWireAgents::AgentBase.new
+    agent.set_dynamic_config_callback do |_q, _b, _h, ephemeral|
+      ephemeral.define_tool(name: 'dynamic_tool', description: 'Added dynamically') { |_, _| }
+    end
+    swml = agent.render_swml
+    ai = swml['sections']['main'].find { |v| v.key?('ai') }['ai']
+    func_names = (ai.dig('SWAIG', 'functions') || []).map { |f| f['function'] }
+    assert_includes func_names, 'dynamic_tool'
+    # Original should have no tools
+    assert_empty agent.define_tools
+  end
+end
+
+# =========================================================================
+# Rack app / HTTP tests
+# =========================================================================
+class AgentRackTest < Minitest::Test
+  include Rack::Test::Methods
+
+  def app
+    @agent = SignalWireAgents::AgentBase.new(basic_auth: ['testuser', 'testpass'])
+    @agent.set_prompt_text('Hello')
+    @agent.define_tool(name: 'echo', description: 'Echo') do |args, _raw|
+      SignalWireAgents::Swaig::FunctionResult.new("Echo: #{args['msg']}")
+    end
+    @agent.on_summary do |summary, _raw|
+      @last_summary = summary
+    end
+    @agent.rack_app
+  end
+
+  def auth_header
+    'Basic ' + ["testuser:testpass"].pack('m0')
+  end
+
+  # --- health / ready (no auth) ---
+
+  def test_health_endpoint
+    get '/health'
+    assert_equal 200, last_response.status
+    data = JSON.parse(last_response.body)
+    assert_equal 'healthy', data['status']
+  end
+
+  def test_ready_endpoint
+    get '/ready'
+    assert_equal 200, last_response.status
+    data = JSON.parse(last_response.body)
+    assert_equal 'ready', data['status']
+  end
+
+  # --- auth required ---
+
+  def test_swml_endpoint_requires_auth
+    get '/'
+    assert_equal 401, last_response.status
+  end
+
+  def test_swml_endpoint_wrong_auth
+    header 'Authorization', 'Basic ' + ['wrong:creds'].pack('m0')
+    get '/'
+    assert_equal 401, last_response.status
+  end
+
+  # --- SWML endpoint ---
+
+  def test_swml_endpoint_get
+    header 'Authorization', auth_header
+    get '/'
+    assert_equal 200, last_response.status
+    swml = JSON.parse(last_response.body)
+    assert_equal '1.0.0', swml['version']
+    ai = swml['sections']['main'].find { |v| v.key?('ai') }['ai']
+    assert_equal 'Hello', ai['prompt']['text']
+  end
+
+  def test_swml_endpoint_post
+    header 'Authorization', auth_header
+    header 'Content-Type', 'application/json'
+    post '/', JSON.generate({ 'call_id' => 'abc-123' })
+    assert_equal 200, last_response.status
+    swml = JSON.parse(last_response.body)
+    assert_equal '1.0.0', swml['version']
+  end
+
+  # --- SWAIG dispatch ---
+
+  def test_swaig_dispatch
+    header 'Authorization', auth_header
+    header 'Content-Type', 'application/json'
+    payload = {
+      'function' => 'echo',
+      'argument' => { 'parsed' => [{ 'msg' => 'test' }] },
+      'call_id' => 'call-1'
+    }
+    post '/swaig', JSON.generate(payload)
+    assert_equal 200, last_response.status
+    result = JSON.parse(last_response.body)
+    assert_equal 'Echo: test', result['response']
+  end
+
+  def test_swaig_dispatch_no_function
+    header 'Authorization', auth_header
+    header 'Content-Type', 'application/json'
+    post '/swaig', JSON.generate({})
+    assert_equal 400, last_response.status
+  end
+
+  def test_swaig_dispatch_unknown_function
+    header 'Authorization', auth_header
+    header 'Content-Type', 'application/json'
+    payload = {
+      'function' => 'unknown',
+      'argument' => { 'parsed' => [{}] }
+    }
+    post '/swaig', JSON.generate(payload)
+    assert_equal 200, last_response.status
+    result = JSON.parse(last_response.body)
+    assert_includes result['response'], 'not found'
+  end
+
+  # --- post_prompt ---
+
+  def test_post_prompt_endpoint
+    header 'Authorization', auth_header
+    header 'Content-Type', 'application/json'
+    payload = {
+      'post_prompt_data' => {
+        'raw' => 'Summary text',
+        'parsed' => { 'summary' => 'Short' }
+      }
+    }
+    post '/post_prompt', JSON.generate(payload)
+    assert_equal 200, last_response.status
+    # Callback should have been called
+    assert_equal({ 'summary' => 'Short' }, @last_summary)
+  end
+
+  # --- security headers ---
+
+  def test_security_headers
+    header 'Authorization', auth_header
+    get '/'
+    assert_equal 'nosniff', last_response.headers['x-content-type-options']
+    assert_equal 'DENY', last_response.headers['x-frame-options']
+    assert_includes last_response.headers['cache-control'], 'no-store'
+  end
+end
+
+# =========================================================================
+# Rack app with custom route
+# =========================================================================
+class AgentCustomRouteRackTest < Minitest::Test
+  include Rack::Test::Methods
+
+  def app
+    @agent = SignalWireAgents::AgentBase.new(
+      route: '/bot',
+      basic_auth: ['u', 'p']
+    )
+    @agent.set_prompt_text('Custom route')
+    @agent.rack_app
+  end
+
+  def auth_header
+    'Basic ' + ['u:p'].pack('m0')
+  end
+
+  def test_custom_route_swml
+    header 'Authorization', auth_header
+    get '/bot'
+    assert_equal 200, last_response.status
+    swml = JSON.parse(last_response.body)
+    assert_equal '1.0.0', swml['version']
+  end
+
+  def test_custom_route_swaig
+    header 'Authorization', auth_header
+    header 'Content-Type', 'application/json'
+    post '/bot/swaig', JSON.generate({ 'function' => 'test' })
+    assert_equal 200, last_response.status
+  end
+end
+
+# =========================================================================
+# Method chaining tests
+# =========================================================================
+class AgentMethodChainingTest < Minitest::Test
+  def test_all_config_methods_return_self
+    agent = SignalWireAgents::AgentBase.new
+
+    assert_same agent, agent.set_prompt_text('x')
+    assert_same agent, agent.set_post_prompt('x')
+    assert_same agent, agent.set_prompt_pom([])
+    assert_same agent, agent.prompt_add_section('T', 'B')
+    assert_same agent, agent.prompt_add_to_section('T', 'x')
+    assert_same agent, agent.prompt_add_subsection('T', 'S', 'B')
+    assert_same agent, agent.add_hint('x')
+    assert_same agent, agent.add_hints(['x'])
+    assert_same agent, agent.add_pattern_hint('p')
+    assert_same agent, agent.add_language({ 'name' => 'E', 'code' => 'en' })
+    assert_same agent, agent.set_languages([])
+    assert_same agent, agent.add_pronunciation('a', 'b')
+    assert_same agent, agent.set_pronunciations([])
+    assert_same agent, agent.set_param('k', 'v')
+    assert_same agent, agent.set_params({})
+    assert_same agent, agent.set_global_data({})
+    assert_same agent, agent.update_global_data({})
+    assert_same agent, agent.set_native_functions([])
+    assert_same agent, agent.set_internal_fillers({})
+    assert_same agent, agent.add_internal_filler('f', 'en', ['x'])
+    assert_same agent, agent.enable_debug_events
+    assert_same agent, agent.add_function_include('url', ['f'])
+    assert_same agent, agent.set_function_includes([])
+    assert_same agent, agent.set_prompt_llm_params(temperature: 0.5)
+    assert_same agent, agent.set_post_prompt_llm_params(temperature: 0.5)
+    assert_same agent, agent.add_pre_answer_verb('play', {})
+    assert_same agent, agent.clear_pre_answer_verbs
+    assert_same agent, agent.add_answer_verb({})
+    assert_same agent, agent.add_post_answer_verb('play', {})
+    assert_same agent, agent.clear_post_answer_verbs
+    assert_same agent, agent.add_post_ai_verb('hangup', {})
+    assert_same agent, agent.clear_post_ai_verbs
+    assert_same agent, agent.set_dynamic_config_callback { |*| }
+    assert_same agent, agent.manual_set_proxy_url('x')
+    assert_same agent, agent.set_web_hook_url('x')
+    assert_same agent, agent.set_post_prompt_url('x')
+    assert_same agent, agent.add_swaig_query_params({})
+    assert_same agent, agent.clear_swaig_query_params
+    assert_same agent, agent.enable_debug_routes
+    assert_same agent, agent.enable_sip_routing
+    assert_same agent, agent.register_sip_username('u')
+    assert_same agent, agent.on_summary {}
+    assert_same agent, agent.on_debug_event {}
+    assert_same agent, agent.register_swaig_function({ 'function' => 'x' })
+    assert_same agent, agent.remove_skill('nonexistent')
+  end
+end
+
+# =========================================================================
+# Proxy URL tests
+# =========================================================================
+class AgentProxyUrlTest < Minitest::Test
+  def test_proxy_url_from_env
+    ENV['SWML_PROXY_URL_BASE'] = 'https://proxy.example.com'
+    agent = SignalWireAgents::AgentBase.new
+    agent.define_tool(name: 'test', description: 'Test') { |_, _| }
+    swml = agent.render_swml
+    ai = swml['sections']['main'].find { |v| v.key?('ai') }['ai']
+    url = ai['SWAIG']['defaults']['web_hook_url']
+    assert_includes url, 'https://proxy.example.com'
+  ensure
+    ENV.delete('SWML_PROXY_URL_BASE')
+  end
+
+  def test_manual_set_proxy_url
+    agent = SignalWireAgents::AgentBase.new
+    agent.manual_set_proxy_url('https://manual.example.com')
+    agent.define_tool(name: 'test', description: 'Test') { |_, _| }
+    swml = agent.render_swml
+    ai = swml['sections']['main'].find { |v| v.key?('ai') }['ai']
+    url = ai['SWAIG']['defaults']['web_hook_url']
+    assert_includes url, 'https://manual.example.com'
+  end
+end
+
+# =========================================================================
+# SWAIG query params tests
+# =========================================================================
+class AgentSwaigQueryParamsTest < Minitest::Test
+  def test_add_swaig_query_params
+    agent = SignalWireAgents::AgentBase.new(basic_auth: ['u', 'p'])
+    agent.add_swaig_query_params({ 'tenant' => 'acme' })
+    agent.define_tool(name: 'test', description: 'Test') { |_, _| }
+    swml = agent.render_swml
+    ai = swml['sections']['main'].find { |v| v.key?('ai') }['ai']
+    url = ai['SWAIG']['defaults']['web_hook_url']
+    assert_includes url, 'tenant=acme'
+  end
+
+  def test_clear_swaig_query_params
+    agent = SignalWireAgents::AgentBase.new
+    agent.add_swaig_query_params({ 'key' => 'val' })
+    agent.clear_swaig_query_params
+    agent.define_tool(name: 'test', description: 'Test') { |_, _| }
+    swml = agent.render_swml
+    ai = swml['sections']['main'].find { |v| v.key?('ai') }['ai']
+    url = ai['SWAIG']['defaults']['web_hook_url']
+    refute_includes url, 'key=val'
+  end
+end
+
+# =========================================================================
+# DataMap integration test
+# =========================================================================
+class AgentDataMapTest < Minitest::Test
+  def test_register_datamap_tool
+    agent = SignalWireAgents::AgentBase.new
+    dm = SignalWireAgents::DataMap.new('get_weather')
+         .purpose('Get weather')
+         .parameter('city', 'string', 'City name', required: true)
+         .webhook('GET', 'https://api.weather.com?q=${city}')
+         .output(SignalWireAgents::Swaig::FunctionResult.new('Weather: ${response.temp}'))
+
+    agent.register_swaig_function(dm.to_swaig_function)
+    swml = agent.render_swml
+    ai = swml['sections']['main'].find { |v| v.key?('ai') }['ai']
+    funcs = ai['SWAIG']['functions']
+    weather = funcs.find { |f| f['function'] == 'get_weather' }
+    assert weather
+    assert weather.key?('data_map')
+  end
+end
+
+# =========================================================================
+# on_debug_event callback test
+# =========================================================================
+class AgentDebugEventTest < Minitest::Test
+  include Rack::Test::Methods
+
+  def app
+    @agent = SignalWireAgents::AgentBase.new(basic_auth: ['u', 'p'])
+    @received_event = nil
+    @agent.on_debug_event do |event_type, data|
+      @received_event = [event_type, data]
+    end
+    @agent.rack_app
+  end
+
+  def test_debug_event_dispatch
+    header 'Authorization', 'Basic ' + ['u:p'].pack('m0')
+    header 'Content-Type', 'application/json'
+    post '/debug_events', JSON.generate({ 'event_type' => 'llm_error', 'detail' => 'oops' })
+    assert_equal 200, last_response.status
+    assert_equal 'llm_error', @received_event[0]
+    assert_equal 'oops', @received_event[1]['detail']
+  end
+end
