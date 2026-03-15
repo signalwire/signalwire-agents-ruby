@@ -575,6 +575,56 @@ module SignalWireAgents
       self
     end
 
+    # Extract a SIP username from a SIP URI string.
+    #
+    # Parses URIs of the form "sip:user@domain" and returns the user part.
+    # Handles optional "sip:" or "sips:" scheme prefixes.
+    #
+    # @param sip_uri [String] a SIP URI, e.g. "sip:alice@example.com"
+    # @return [String, nil] the username, or nil if the URI cannot be parsed
+    def self.extract_sip_username(sip_uri)
+      return nil if sip_uri.nil? || sip_uri.empty?
+
+      # Strip optional sip:/sips: scheme
+      uri = sip_uri.to_s.strip
+      uri = uri.sub(%r{\Asips?:}, '')
+
+      # Extract user part before @
+      if uri.include?('@')
+        user = uri.split('@', 2).first
+        user && !user.empty? ? user : nil
+      else
+        nil
+      end
+    end
+
+    # Extract the SIP username from request body data.
+    #
+    # Looks for SIP URI in common request body fields
+    # (e.g., "to", "from", "sip_uri", "call.to", "call.from").
+    #
+    # @param request_data [Hash] the parsed request body
+    # @return [String, nil] the extracted SIP username, or nil
+    def self.extract_sip_username_from_request(request_data)
+      return nil unless request_data.is_a?(Hash)
+
+      # Check common SIP URI fields
+      candidates = [
+        request_data['to'],
+        request_data['from'],
+        request_data['sip_uri'],
+        request_data.dig('call', 'to'),
+        request_data.dig('call', 'from')
+      ].compact
+
+      candidates.each do |uri|
+        username = extract_sip_username(uri.to_s)
+        return username if username
+      end
+
+      nil
+    end
+
     # ==================================================================
     # Lifecycle
     # ==================================================================
@@ -597,8 +647,8 @@ module SignalWireAgents
     def serve
       require 'webrick'
       @logger.info "Starting server on #{@host}:#{@port} ..."
-      user, pass = @basic_auth
-      @logger.info "Basic-auth credentials — user: #{user}  password: #{pass}"
+      user, _pass = @basic_auth
+      @logger.info "Basic-auth credentials — user: #{user}  password: [REDACTED]"
 
       @server = ::WEBrick::HTTPServer.new(
         Host: @host,

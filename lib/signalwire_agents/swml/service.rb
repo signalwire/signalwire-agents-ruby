@@ -154,8 +154,8 @@ module SignalWireAgents
         require 'webrick'
         @log.info "Starting server on #{@host}:#{@port} ..."
 
-        user, pass = @basic_auth
-        @log.info "Basic-auth credentials — user: #{user}  password: #{pass}"
+        user, _pass = @basic_auth
+        @log.info "Basic-auth credentials — user: #{user}  password: [REDACTED]"
 
         @server = ::WEBrick::HTTPServer.new(
           Host: @host,

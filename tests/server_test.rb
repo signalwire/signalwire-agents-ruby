@@ -2,6 +2,8 @@
 
 require 'minitest/autorun'
 require 'json'
+require 'fileutils'
+require 'tmpdir'
 
 require_relative '../lib/signalwire_agents/server/agent_server'
 
@@ -177,5 +179,104 @@ class AgentServerTest < Minitest::Test
     agent = MockAgent.new(name: 'test', route: '/test')
     result = @server.register(agent)
     assert_same @server, result
+  end
+end
+
+# =========================================================================
+# Static file serving tests
+# =========================================================================
+class AgentServerStaticFilesTest < Minitest::Test
+  def setup
+    @server = SignalWireAgents::AgentServer.new(host: '127.0.0.1', port: 4567)
+
+    # Create a temporary directory with test files
+    @tmpdir = File.join(Dir.tmpdir, "swaig_test_static_#{$$}")
+    FileUtils.mkdir_p(@tmpdir)
+    File.write(File.join(@tmpdir, 'index.html'), '<html><body>Hello</body></html>')
+    File.write(File.join(@tmpdir, 'style.css'), 'body { color: red; }')
+    File.write(File.join(@tmpdir, 'data.json'), '{"key":"value"}')
+    FileUtils.mkdir_p(File.join(@tmpdir, 'sub'))
+    File.write(File.join(@tmpdir, 'sub', 'page.html'), '<html>Sub</html>')
+  end
+
+  def teardown
+    FileUtils.rm_rf(@tmpdir) if @tmpdir && File.directory?(@tmpdir)
+  end
+
+  def test_serve_static_files_returns_self
+    result = @server.serve_static_files(@tmpdir, '/static')
+    assert_same @server, result
+  end
+
+  def test_serve_static_files_nonexistent_dir_raises
+    assert_raises(ArgumentError) do
+      @server.serve_static_files('/nonexistent/path/xyz', '/static')
+    end
+  end
+
+  def test_serve_index_html
+    @server.serve_static_files(@tmpdir, '/static')
+    app = @server.rack_app
+    status, headers, body = app.call({ 'PATH_INFO' => '/static/' })
+    assert_equal '200', status
+    assert_equal 'text/html', headers['Content-Type']
+    assert_includes body.first, 'Hello'
+  end
+
+  def test_serve_css_file
+    @server.serve_static_files(@tmpdir, '/static')
+    app = @server.rack_app
+    status, headers, body = app.call({ 'PATH_INFO' => '/static/style.css' })
+    assert_equal '200', status
+    assert_equal 'text/css', headers['Content-Type']
+    assert_includes body.first, 'color: red'
+  end
+
+  def test_serve_json_file
+    @server.serve_static_files(@tmpdir, '/static')
+    app = @server.rack_app
+    status, headers, body = app.call({ 'PATH_INFO' => '/static/data.json' })
+    assert_equal '200', status
+    assert_equal 'application/json', headers['Content-Type']
+  end
+
+  def test_serve_sub_directory_file
+    @server.serve_static_files(@tmpdir, '/static')
+    app = @server.rack_app
+    status, _, body = app.call({ 'PATH_INFO' => '/static/sub/page.html' })
+    assert_equal '200', status
+    assert_includes body.first, 'Sub'
+  end
+
+  def test_security_headers_on_static
+    @server.serve_static_files(@tmpdir, '/static')
+    app = @server.rack_app
+    _, headers, _ = app.call({ 'PATH_INFO' => '/static/index.html' })
+    assert_equal 'nosniff', headers['x-content-type-options']
+    assert_equal 'DENY', headers['x-frame-options']
+    assert_includes headers['cache-control'], 'no-store'
+  end
+
+  def test_path_traversal_blocked
+    @server.serve_static_files(@tmpdir, '/static')
+    app = @server.rack_app
+    status, _, _ = app.call({ 'PATH_INFO' => '/static/../../../etc/passwd' })
+    assert_equal '403', status
+  end
+
+  def test_nonexistent_file_falls_through
+    @server.serve_static_files(@tmpdir, '/static')
+    app = @server.rack_app
+    status, _, _ = app.call({ 'PATH_INFO' => '/static/nonexistent.txt' })
+    # Should fall through to 404 since no agent matches either
+    assert_equal '404', status
+  end
+
+  def test_static_route_without_trailing_slash_serves_index
+    @server.serve_static_files(@tmpdir, '/static')
+    app = @server.rack_app
+    status, _, body = app.call({ 'PATH_INFO' => '/static' })
+    assert_equal '200', status
+    assert_includes body.first, 'Hello'
   end
 end

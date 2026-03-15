@@ -1,0 +1,310 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Copyright (c) 2025 SignalWire
+#
+# Licensed under the MIT License.
+# See LICENSE file in the project root for full license information.
+
+#
+# swaig-test — CLI tool for testing SWAIG agent endpoints.
+#
+# Usage:
+#   swaig-test --url http://user:pass@host:port/route --dump-swml
+#   swaig-test --url http://user:pass@host:port/route --list-tools
+#   swaig-test --url http://user:pass@host:port/route --exec tool_name --param key=value
+#
+
+require 'net/http'
+require 'uri'
+require 'json'
+require 'optparse'
+
+module SwaigTest
+  class CLI
+    attr_reader :options
+
+    def initialize(argv = ARGV)
+      @options = {
+        url: nil,
+        dump_swml: false,
+        list_tools: false,
+        exec: nil,
+        params: {},
+        raw: false,
+        verbose: false
+      }
+      parse_options(argv)
+    end
+
+    def run
+      validate_options!
+
+      if @options[:dump_swml]
+        dump_swml
+      elsif @options[:list_tools]
+        list_tools
+      elsif @options[:exec]
+        exec_function
+      else
+        $stderr.puts "Error: specify --dump-swml, --list-tools, or --exec NAME"
+        exit 1
+      end
+    end
+
+    private
+
+    def parse_options(argv)
+      parser = OptionParser.new do |opts|
+        opts.banner = "Usage: swaig-test [options]"
+
+        opts.on("--url URL", "Agent URL with embedded auth (http://user:pass@host:port/route)") do |v|
+          @options[:url] = v
+        end
+
+        opts.on("--dump-swml", "GET SWML document and pretty-print it") do
+          @options[:dump_swml] = true
+        end
+
+        opts.on("--list-tools", "List available SWAIG functions") do
+          @options[:list_tools] = true
+        end
+
+        opts.on("--exec NAME", "Execute a SWAIG function by name") do |v|
+          @options[:exec] = v
+        end
+
+        opts.on("--param KEY=VALUE", "Set a parameter (repeatable)") do |v|
+          key, value = v.split('=', 2)
+          if key && value
+            # Try to parse as JSON value (number, bool, etc.)
+            @options[:params][key] = parse_param_value(value)
+          else
+            $stderr.puts "Warning: ignoring malformed --param '#{v}' (expected key=value)"
+          end
+        end
+
+        opts.on("--raw", "Output compact JSON instead of pretty-printed") do
+          @options[:raw] = true
+        end
+
+        opts.on("--verbose", "Show request/response details") do
+          @options[:verbose] = true
+        end
+
+        opts.on("-h", "--help", "Show this help") do
+          puts opts
+          exit 0
+        end
+      end
+
+      parser.parse!(argv)
+    end
+
+    def validate_options!
+      unless @options[:url]
+        $stderr.puts "Error: --url is required"
+        exit 1
+      end
+
+      actions = [@options[:dump_swml], @options[:list_tools], !!@options[:exec]].count(true)
+      if actions == 0
+        $stderr.puts "Error: specify one of --dump-swml, --list-tools, or --exec NAME"
+        exit 1
+      elsif actions > 1
+        $stderr.puts "Error: specify only one of --dump-swml, --list-tools, or --exec NAME"
+        exit 1
+      end
+    end
+
+    def parse_param_value(value)
+      case value
+      when 'true'  then true
+      when 'false' then false
+      when 'null', 'nil' then nil
+      when /\A-?\d+\z/ then value.to_i
+      when /\A-?\d+\.\d+\z/ then value.to_f
+      else value
+      end
+    end
+
+    def parsed_uri
+      @parsed_uri ||= URI.parse(@options[:url])
+    end
+
+    def base_path
+      path = parsed_uri.path
+      path = '/' if path.nil? || path.empty?
+      path.chomp('/')
+    end
+
+    def auth_header
+      user = parsed_uri.user
+      pass = parsed_uri.password
+      if user && pass
+        "Basic " + ["#{URI.decode_www_form_component(user)}:#{URI.decode_www_form_component(pass)}"].pack('m0')
+      else
+        nil
+      end
+    end
+
+    def make_request(method, path, body: nil)
+      full_path = base_path == '/' ? path : "#{base_path}#{path}"
+      full_path = '/' if full_path.empty?
+
+      uri = parsed_uri.dup
+      uri.path = full_path
+      uri.user = nil
+      uri.password = nil
+
+      if @options[:verbose]
+        $stderr.puts ">> #{method.upcase} #{uri}"
+        $stderr.puts ">> Authorization: Basic <redacted>" if auth_header
+        if body
+          $stderr.puts ">> Content-Type: application/json"
+          $stderr.puts ">> Body: #{body}"
+        end
+        $stderr.puts ""
+      end
+
+      http = Net::HTTP.new(uri.host, uri.port)
+      http.use_ssl = (uri.scheme == 'https')
+      http.open_timeout = 10
+      http.read_timeout = 30
+
+      if method == :get
+        req = Net::HTTP::Get.new(uri.request_uri)
+      else
+        req = Net::HTTP::Post.new(uri.request_uri)
+        req.body = body
+        req['Content-Type'] = 'application/json'
+      end
+
+      req['Authorization'] = auth_header if auth_header
+
+      response = http.request(req)
+
+      if @options[:verbose]
+        $stderr.puts "<< HTTP #{response.code} #{response.message}"
+        response.each_header { |k, v| $stderr.puts "<< #{k}: #{v}" }
+        $stderr.puts ""
+      end
+
+      response
+    end
+
+    def format_json(data)
+      if @options[:raw]
+        JSON.generate(data)
+      else
+        JSON.pretty_generate(data)
+      end
+    end
+
+    def dump_swml
+      response = make_request(:get, '/')
+
+      unless response.is_a?(Net::HTTPSuccess)
+        $stderr.puts "Error: HTTP #{response.code} #{response.message}"
+        $stderr.puts response.body if @options[:verbose]
+        exit 1
+      end
+
+      data = JSON.parse(response.body)
+      puts format_json(data)
+    rescue JSON::ParserError => e
+      $stderr.puts "Error: invalid JSON response: #{e.message}"
+      $stderr.puts response.body if @options[:verbose]
+      exit 1
+    end
+
+    def list_tools
+      response = make_request(:get, '/')
+
+      unless response.is_a?(Net::HTTPSuccess)
+        $stderr.puts "Error: HTTP #{response.code} #{response.message}"
+        exit 1
+      end
+
+      swml = JSON.parse(response.body)
+      functions = extract_functions(swml)
+
+      if functions.empty?
+        puts "No SWAIG functions found."
+        return
+      end
+
+      puts "SWAIG Functions:"
+      puts "-" * 60
+      functions.each do |func|
+        name = func['function'] || '(unnamed)'
+        desc = func['description'] || '(no description)'
+        puts "  #{name}"
+        puts "    #{desc}"
+
+        params = func['parameters']
+        if params.is_a?(Hash) && params['properties'].is_a?(Hash) && !params['properties'].empty?
+          puts "    Parameters:"
+          params['properties'].each do |pname, pdef|
+            ptype = pdef['type'] || 'any' rescue 'any'
+            pdesc = pdef['description'] || '' rescue ''
+            required = (params['required'] || []).include?(pname) ? ' (required)' : ''
+            puts "      - #{pname}: #{ptype}#{required} #{pdesc}"
+          end
+        end
+        puts ""
+      end
+    rescue JSON::ParserError => e
+      $stderr.puts "Error: invalid JSON response: #{e.message}"
+      exit 1
+    end
+
+    def exec_function
+      func_name = @options[:exec]
+      payload = {
+        'function' => func_name,
+        'argument' => {
+          'parsed' => [@options[:params]]
+        }
+      }
+
+      response = make_request(:post, '/swaig', body: JSON.generate(payload))
+
+      unless response.is_a?(Net::HTTPSuccess)
+        $stderr.puts "Error: HTTP #{response.code} #{response.message}"
+        $stderr.puts response.body if @options[:verbose]
+        exit 1
+      end
+
+      data = JSON.parse(response.body)
+      puts format_json(data)
+    rescue JSON::ParserError => e
+      $stderr.puts "Error: invalid JSON response: #{e.message}"
+      exit 1
+    end
+
+    def extract_functions(swml)
+      functions = []
+
+      # Navigate the SWML structure to find AI → SWAIG → functions
+      sections = swml['sections'] || {}
+      main = sections['main'] || []
+
+      main.each do |verb|
+        if verb.is_a?(Hash) && verb.key?('ai')
+          ai = verb['ai']
+          swaig = ai['SWAIG'] || {}
+          funcs = swaig['functions'] || []
+          functions.concat(funcs)
+        end
+      end
+
+      functions
+    end
+  end
+end
+
+# Run when invoked directly
+if __FILE__ == $PROGRAM_NAME
+  SwaigTest::CLI.new.run
+end

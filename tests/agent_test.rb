@@ -1026,3 +1026,92 @@ class AgentDebugEventTest < Minitest::Test
     assert_equal 'oops', @received_event[1]['detail']
   end
 end
+
+# =========================================================================
+# SIP username extraction tests
+# =========================================================================
+class AgentSipUsernameTest < Minitest::Test
+  def test_extract_sip_username_basic
+    assert_equal 'alice', SignalWireAgents::AgentBase.extract_sip_username('sip:alice@example.com')
+  end
+
+  def test_extract_sips_username
+    assert_equal 'bob', SignalWireAgents::AgentBase.extract_sip_username('sips:bob@example.com')
+  end
+
+  def test_extract_without_scheme
+    assert_equal 'carol', SignalWireAgents::AgentBase.extract_sip_username('carol@example.com')
+  end
+
+  def test_extract_nil_returns_nil
+    assert_nil SignalWireAgents::AgentBase.extract_sip_username(nil)
+  end
+
+  def test_extract_empty_returns_nil
+    assert_nil SignalWireAgents::AgentBase.extract_sip_username('')
+  end
+
+  def test_extract_no_at_sign_returns_nil
+    assert_nil SignalWireAgents::AgentBase.extract_sip_username('sip:justuser')
+  end
+
+  def test_extract_empty_user_part_returns_nil
+    assert_nil SignalWireAgents::AgentBase.extract_sip_username('sip:@example.com')
+  end
+
+  def test_extract_from_request_to_field
+    data = { 'to' => 'sip:alice@example.com' }
+    assert_equal 'alice', SignalWireAgents::AgentBase.extract_sip_username_from_request(data)
+  end
+
+  def test_extract_from_request_from_field
+    data = { 'from' => 'sip:bob@example.com' }
+    assert_equal 'bob', SignalWireAgents::AgentBase.extract_sip_username_from_request(data)
+  end
+
+  def test_extract_from_request_sip_uri_field
+    data = { 'sip_uri' => 'sip:carol@example.com' }
+    assert_equal 'carol', SignalWireAgents::AgentBase.extract_sip_username_from_request(data)
+  end
+
+  def test_extract_from_request_nested_call_to
+    data = { 'call' => { 'to' => 'sip:dave@example.com' } }
+    assert_equal 'dave', SignalWireAgents::AgentBase.extract_sip_username_from_request(data)
+  end
+
+  def test_extract_from_request_nested_call_from
+    data = { 'call' => { 'from' => 'sip:eve@example.com' } }
+    assert_equal 'eve', SignalWireAgents::AgentBase.extract_sip_username_from_request(data)
+  end
+
+  def test_extract_from_request_nil
+    assert_nil SignalWireAgents::AgentBase.extract_sip_username_from_request(nil)
+  end
+
+  def test_extract_from_request_empty
+    assert_nil SignalWireAgents::AgentBase.extract_sip_username_from_request({})
+  end
+
+  def test_extract_from_request_no_sip_fields
+    data = { 'call_id' => 'abc-123', 'function' => 'test' }
+    assert_nil SignalWireAgents::AgentBase.extract_sip_username_from_request(data)
+  end
+
+  def test_extract_from_request_prefers_first_match
+    data = { 'to' => 'sip:first@example.com', 'from' => 'sip:second@example.com' }
+    assert_equal 'first', SignalWireAgents::AgentBase.extract_sip_username_from_request(data)
+  end
+end
+
+# =========================================================================
+# Password not logged test
+# =========================================================================
+class AgentPasswordNotLoggedTest < Minitest::Test
+  def test_password_not_in_log_output
+    # Read the source file and verify password is redacted in log messages
+    source = File.read(File.join(__dir__, '..', 'lib', 'signalwire_agents', 'agent', 'agent_base.rb'))
+    # The serve method should log [REDACTED] not the actual password
+    assert_includes source, 'password: [REDACTED]'
+    refute_match(/password: #\{pass\}/, source)
+  end
+end
