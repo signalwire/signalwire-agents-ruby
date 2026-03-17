@@ -656,7 +656,16 @@ module SignalWireAgents
         Logger: WEBrick::Log.new($stderr, WEBrick::Log::WARN),
         AccessLog: []
       )
-      @server.mount '/', Rack::Handler::WEBrick, rack_app
+
+      # Rack 3+ moved Handler to the rackup gem
+      handler = begin
+                  require 'rackup/handler/webrick'
+                  Rackup::Handler::WEBrick
+                rescue LoadError
+                  require 'rack/handler/webrick'
+                  Rack::Handler::WEBrick
+                end
+      @server.mount '/', handler, rack_app
 
       trap('INT')  { @server.shutdown }
       trap('TERM') { @server.shutdown }
