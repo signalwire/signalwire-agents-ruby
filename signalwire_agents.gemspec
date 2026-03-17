@@ -1,6 +1,6 @@
 Gem::Specification.new do |s|
   s.name        = 'signalwire_agents'
-  s.version     = '1.0.0'
+  s.version     = '1.1.0'
   s.summary     = 'SignalWire AI Agents SDK'
   s.description = 'A Ruby framework for building, deploying, and managing AI agents as microservices that interact with the SignalWire platform.'
   s.authors     = ['SignalWire']
