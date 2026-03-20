@@ -129,6 +129,10 @@ module SignalWireAgents
       @sip_path            = '/sip'
       @sip_usernames       = []
 
+      # --- MCP ----------------------------------------------------------
+      @mcp_servers         = []     # external MCP server configs
+      @mcp_server_enabled  = false  # expose /mcp endpoint
+
       @logger.info "Agent '#{@name}' initialised (route=#{@route}, port=#{@port})"
     end
 
@@ -626,6 +630,142 @@ module SignalWireAgents
     end
 
     # ==================================================================
+    # MCP integration
+    # ==================================================================
+
+    # Add an external MCP server for tool discovery and invocation.
+    #
+    # @param url [String] MCP server HTTP endpoint URL
+    # @param headers [Hash, nil] optional HTTP headers
+    # @param resources [Boolean] whether to fetch resources into global_data
+    # @param resource_vars [Hash, nil] variables for URI template substitution
+    # @return [self]
+    def add_mcp_server(url, headers: nil, resources: false, resource_vars: nil)
+      server = { 'url' => url }
+      server['headers']       = headers       if headers && !headers.empty?
+      server['resources']     = true          if resources
+      server['resource_vars'] = resource_vars if resource_vars && !resource_vars.empty?
+      @mcp_servers << server
+      self
+    end
+
+    # Expose this agent's tools as an MCP server endpoint at /mcp.
+    #
+    # @return [self]
+    def enable_mcp_server
+      @mcp_server_enabled = true
+      self
+    end
+
+    # @api private
+    # Build MCP tool list from registered tools.
+    def _build_mcp_tool_list
+      tools = []
+      @tools.each do |name, tool|
+        t = {
+          'name'        => name,
+          'description' => tool[:definition]['description'] || name,
+        }
+        params = tool[:definition]['parameters']
+        if params && !params.empty?
+          t['inputSchema'] = params.key?('type') ? params : { 'type' => 'object', 'properties' => params }
+        else
+          t['inputSchema'] = { 'type' => 'object', 'properties' => {} }
+        end
+        tools << t
+      end
+      tools
+    end
+
+    # @api private
+    # Handle a single MCP JSON-RPC 2.0 request and return the response hash.
+    def _handle_mcp_request(body)
+      jsonrpc = body['jsonrpc']
+      method  = body['method'] || ''
+      req_id  = body['id']
+      params  = body['params'] || {}
+
+      unless jsonrpc == '2.0'
+        return _mcp_error(req_id, -32600, 'Invalid JSON-RPC version')
+      end
+
+      case method
+      when 'initialize'
+        {
+          'jsonrpc' => '2.0', 'id' => req_id,
+          'result' => {
+            'protocolVersion' => '2025-06-18',
+            'capabilities'   => { 'tools' => {} },
+            'serverInfo'     => { 'name' => @name, 'version' => '1.0.0' }
+          }
+        }
+      when 'notifications/initialized'
+        { 'jsonrpc' => '2.0', 'id' => req_id, 'result' => {} }
+      when 'tools/list'
+        {
+          'jsonrpc' => '2.0', 'id' => req_id,
+          'result' => { 'tools' => _build_mcp_tool_list }
+        }
+      when 'tools/call'
+        tool_name = params['name'] || ''
+        arguments = params['arguments'] || {}
+
+        tool = @tools[tool_name]
+        unless tool
+          return _mcp_error(req_id, -32602, "Unknown tool: #{tool_name}")
+        end
+
+        begin
+          raw_data = {
+            'function' => tool_name,
+            'argument' => { 'parsed' => [arguments] }
+          }
+          result = tool[:handler].call(arguments, raw_data)
+
+          response_text = ''
+          if result.respond_to?(:to_h)
+            h = result.to_h
+            response_text = h['response'] || ''
+          elsif result.is_a?(Hash)
+            response_text = result['response'] || result.to_s
+          elsif result.is_a?(String)
+            response_text = result
+          end
+
+          {
+            'jsonrpc' => '2.0', 'id' => req_id,
+            'result' => {
+              'content' => [{ 'type' => 'text', 'text' => response_text }],
+              'isError' => false
+            }
+          }
+        rescue => e
+          @logger.error "MCP tool call error: #{tool_name}: #{e.message}"
+          {
+            'jsonrpc' => '2.0', 'id' => req_id,
+            'result' => {
+              'content' => [{ 'type' => 'text', 'text' => "Error: #{e.message}" }],
+              'isError' => true
+            }
+          }
+        end
+      when 'ping'
+        { 'jsonrpc' => '2.0', 'id' => req_id, 'result' => {} }
+      else
+        _mcp_error(req_id, -32601, "Method not found: #{method}")
+      end
+    end
+
+    # @api private
+    def _mcp_error(req_id, code, message)
+      {
+        'jsonrpc' => '2.0',
+        'id'      => req_id,
+        'error'   => { 'code' => code, 'message' => message }
+      }
+    end
+
+    # ==================================================================
     # Lifecycle
     # ==================================================================
 
@@ -845,6 +985,9 @@ module SignalWireAgents
         end
       end
 
+      # --- MCP servers ---------------------------------------------------
+      ai['mcp_servers'] = @mcp_servers.map(&:dup) unless @mcp_servers.empty?
+
       ai
     end
 
@@ -933,6 +1076,8 @@ module SignalWireAgents
       copy.instance_variable_set(:@answer_config,        @answer_config.dup)
       copy.instance_variable_set(:@swaig_query_params,   @swaig_query_params.dup)
       copy.instance_variable_set(:@loaded_skills,        @loaded_skills.dup)
+      copy.instance_variable_set(:@mcp_servers,          @mcp_servers.map(&:dup))
+      copy.instance_variable_set(:@mcp_server_enabled,   @mcp_server_enabled)
       # Don't copy the dynamic config callback to prevent infinite recursion
       copy.instance_variable_set(:@dynamic_config_callback, nil)
       copy
@@ -1013,6 +1158,8 @@ module SignalWireAgents
               agent._handle_post_prompt(request_data, env)
             when '/debug_events'
               agent._handle_debug_events(request_data, env)
+            when '/mcp'
+              agent._handle_mcp_endpoint(request_data, env)
             else
               # SWML endpoint
               swml = agent.render_swml(request_data, request: request)
@@ -1087,6 +1234,24 @@ module SignalWireAgents
       end
 
       body = JSON.generate({ 'status' => 'ok' })
+      [200, { 'content-type' => 'application/json' }, [body]]
+    end
+
+    # Handle MCP JSON-RPC 2.0 endpoint.
+    # @api private
+    def _handle_mcp_endpoint(request_data, _env)
+      unless @mcp_server_enabled
+        body = JSON.generate({ 'error' => 'MCP server not enabled' })
+        return [404, { 'content-type' => 'application/json' }, [body]]
+      end
+
+      unless request_data
+        body = JSON.generate(_mcp_error(nil, -32700, 'Parse error'))
+        return [400, { 'content-type' => 'application/json' }, [body]]
+      end
+
+      resp = _handle_mcp_request(request_data)
+      body = JSON.generate(resp)
       [200, { 'content-type' => 'application/json' }, [body]]
     end
 
